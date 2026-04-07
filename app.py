@@ -331,6 +331,90 @@ def logout():
 
 
 # ============================================================================
+# OAuth 2.0 User Login (for regular users, not OAuth apps)
+# ============================================================================
+
+@app.route("/oauth/user-login")
+def oauth_user_login():
+    """Start OAuth login flow for regular users."""
+    # For user login, we create an internal OAuth client
+    # Generate state for CSRF protection
+    state = secrets.token_urlsafe(32)
+    session["oauth_state"] = state
+    session["oauth_redirect"] = url_for("oauth_user_callback", _external=True)
+    
+    # Use a special internal client for user login
+    auth_url = (
+        f"{url_for('oauth_authorize', _external=True)}"
+        f"?client_id=__internal_user_login__"
+        f"&redirect_uri={session['oauth_redirect']}"
+        f"&scope=profile+email"
+        f"&state={state}"
+    )
+    return redirect(auth_url)
+
+
+@app.route("/oauth/user-callback")
+def oauth_user_callback():
+    """Handle OAuth callback from user login flow."""
+    # Verify state parameter for CSRF protection
+    state = request.args.get("state")
+    if state != session.get("oauth_state"):
+        flash("Security error: State mismatch. Please try logging in again.", "error")
+        return redirect(url_for("login"))
+    
+    # Get authorization code
+    code = request.args.get("code")
+    if not code:
+        flash("Login failed: No authorization code received.", "error")
+        return redirect(url_for("login"))
+    
+    # Exchange code for access token (internal process, no external call)
+    conn = get_db_connection()
+    
+    # Validate and use the authorization code
+    auth_code_record = conn.execute(
+        "SELECT * FROM authorization_codes WHERE code = ? AND used = 0",
+        (code,)
+    ).fetchone()
+    
+    if not auth_code_record:
+        conn.close()
+        flash("Login failed: Invalid or expired authorization code.", "error")
+        return redirect(url_for("login"))
+    
+    if datetime.fromisoformat(auth_code_record["expires_at"]) < datetime.now():
+        conn.close()
+        flash("Login failed: Authorization code expired.", "error")
+        return redirect(url_for("login"))
+    
+    # Mark code as used
+    conn.execute("UPDATE authorization_codes SET used = 1 WHERE code = ?", (code,))
+    
+    # Get user info
+    user = conn.execute(
+        "SELECT * FROM users WHERE id = ?",
+        (auth_code_record["user_id"],)
+    ).fetchone()
+    
+    conn.commit()
+    conn.close()
+    
+    if not user:
+        flash("Login failed: User not found.", "error")
+        return redirect(url_for("login"))
+    
+    # Set user session
+    session["user_id"] = user["id"]
+    session["username"] = user["username"]
+    if user["email"]:
+        session["email"] = user["email"]
+    
+    flash(f"Welcome, {user['username']}! You are logged in via OAuth.", "success")
+    return redirect(url_for("dashboard"))
+
+
+# ============================================================================
 # OAuth 2.0 Server Endpoints
 # ============================================================================
 
@@ -347,6 +431,55 @@ def oauth_authorize():
         if not client_id or not redirect_uri:
             return "Missing required parameters: client_id, redirect_uri", 400
         
+        # Special case: Internal user login (skip client validation)
+        if client_id == "__internal_user_login__":
+            # This is an internal OAuth flow for user login
+            # Skip client validation, just check redirect_uri is from current site
+            if not redirect_uri.startswith(request.host_url):
+                return "Invalid redirect_uri", 400
+            
+            # If user is not logged in, redirect to login
+            if "user_id" not in session:
+                session["oauth_pending"] = {
+                    "client_id": client_id,
+                    "redirect_uri": redirect_uri,
+                    "state": state,
+                    "scope": scope,
+                    "is_user_login": True
+                }
+                return redirect(url_for("login"))
+            
+            # User is already logged in, proceed to approval
+            # For user login, auto-approve (don't show consent screen)
+            oauth_data = {
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "state": state,
+                "scope": scope,
+                "is_user_login": True
+            }
+            
+            # Generate authorization code
+            auth_code = generate_authorization_code()
+            expires_at = datetime.now() + timedelta(minutes=10)
+            
+            conn = get_db_connection()
+            conn.execute(
+                """
+                INSERT INTO authorization_codes 
+                (code, client_id, user_id, redirect_uri, scope, state, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (auth_code, client_id, session["user_id"], redirect_uri, scope, state, expires_at.isoformat())
+            )
+            conn.commit()
+            conn.close()
+            
+            # Redirect back with code
+            redirect_url = f"{redirect_uri}?code={auth_code}&state={state}"
+            return redirect(redirect_url)
+        
+        # Regular OAuth client flow
         # Validate client
         conn = get_db_connection()
         client = conn.execute(
