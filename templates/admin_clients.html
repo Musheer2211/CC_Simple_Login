@@ -1,0 +1,80 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div style="max-width: 800px; margin: 2rem auto;">
+  <h2>OAuth Client Management</h2>
+  
+  <div style="background-color: #f9f9f9; padding: 2rem; border-radius: 8px; margin-bottom: 2rem;">
+    <h3>Register New OAuth Client</h3>
+    <form method="post">
+      <div class="form-group">
+        <label for="app_name">Application Name</label>
+        <input 
+          id="app_name" 
+          name="app_name" 
+          type="text" 
+          placeholder="e.g., My Mobile App" 
+          required 
+          style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;"
+        />
+      </div>
+      
+      <div class="form-group">
+        <label for="redirect_uris">Redirect URIs (comma-separated)</label>
+        <textarea 
+          id="redirect_uris" 
+          name="redirect_uris" 
+          placeholder="e.g., http://localhost:3000/callback, https://myapp.com/oauth/callback" 
+          required 
+          style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; height: 80px; font-family: monospace; font-size: 12px;"
+        ></textarea>
+      </div>
+      
+      <button type="submit" style="background-color: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-size: 16px;">
+        Register Client
+      </button>
+    </form>
+  </div>
+  
+  {% if clients %}
+    <h3>Registered Clients</h3>
+    <table style="width: 100%; border-collapse: collapse;">
+      <thead>
+        <tr style="background-color: #f0f0f0; border-bottom: 2px solid #999;">
+          <th style="padding: 12px; text-align: left;">App Name</th>
+          <th style="padding: 12px; text-align: left;">Client ID</th>
+          <th style="padding: 12px; text-align: left;">Redirect URIs</th>
+          <th style="padding: 12px; text-align: left;">Created</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for client in clients %}
+          <tr style="border-bottom: 1px solid #ddd;">
+            <td style="padding: 12px;">{{ client['app_name'] }}</td>
+            <td style="padding: 12px; font-family: monospace; font-size: 12px; word-break: break-all;">{{ client['client_id'] }}</td>
+            <td style="padding: 12px; font-size: 12px;">
+              {% for uri in client['redirect_uris'].split(',') %}
+                <div style="margin-bottom: 4px;">{{ uri.strip() }}</div>
+              {% endfor %}
+            </td>
+            <td style="padding: 12px; font-size: 12px;">{{ client['created_at'] }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p>No OAuth clients registered yet.</p>
+  {% endif %}
+  
+  <div style="margin-top: 3rem; padding: 1.5rem; background-color: #e3f2fd; border-left: 4px solid #2196F3; border-radius: 4px;">
+    <h4 style="margin-top: 0;">OAuth Flow Guide</h4>
+    <ol style="font-size: 14px;">
+      <li><strong>Authorization Endpoint:</strong> <code>/oauth/authorize</code></li>
+      <li><strong>Token Endpoint:</strong> <code>/oauth/token</code></li>
+      <li><strong>User Info Endpoint:</strong> <code>/oauth/userinfo</code></li>
+      <li><strong>OAuth Info:</strong> <code>/oauth/info</code></li>
+    </ol>
+    <p style="font-size: 14px; color: #666;">See the documentation for integration examples.</p>
+  </div>
+</div>
+{% endblock %}

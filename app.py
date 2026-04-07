@@ -1,25 +1,16 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash
+from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
-from authlib.integrations.flask_client import OAuth
 import sqlite3
 import os
+import secrets
+from datetime import datetime, timedelta
+from functools import wraps
+import json
 
 app = Flask(__name__)
 app.secret_key = "change-this-to-a-secret-key"
 
 DATABASE = "users.db"
-
-# OAuth Configuration
-oauth = OAuth(app)
-google = oauth.register(
-    name='google',
-    client_id=os.getenv('GOOGLE_CLIENT_ID'),
-    client_secret=os.getenv('GOOGLE_CLIENT_SECRET'),
-    client_kwargs={'scope': 'openid profile email'},
-    authorize_url='https://accounts.google.com/o/oauth2/v2/auth',
-    token_url='https://oauth2.googleapis.com/token',
-    userinfo_endpoint='https://openidconnect.googleapis.com/v1/userinfo',
-)
 
 
 def get_db_connection():
@@ -30,17 +21,88 @@ def get_db_connection():
 
 def init_db():
     conn = get_db_connection()
+    
+    # Users table
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE,
-            google_id TEXT UNIQUE,
             email TEXT UNIQUE,
-            password_hash TEXT
+            password_hash TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
+    
+    # OAuth clients (apps that want to use our OAuth server)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS oauth_clients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_id TEXT UNIQUE NOT NULL,
+            client_secret TEXT NOT NULL,
+            app_name TEXT NOT NULL,
+            redirect_uris TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    
+    # Authorization codes (short-lived, single-use)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS authorization_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE NOT NULL,
+            client_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            redirect_uri TEXT NOT NULL,
+            scope TEXT,
+            state TEXT,
+            expires_at TIMESTAMP NOT NULL,
+            used INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(client_id) REFERENCES oauth_clients(client_id),
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+    
+    # Access tokens (medium-lived)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS access_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token TEXT UNIQUE NOT NULL,
+            client_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            scope TEXT,
+            expires_at TIMESTAMP NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(client_id) REFERENCES oauth_clients(client_id),
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+    
+    # Refresh tokens (long-lived)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS refresh_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token TEXT UNIQUE NOT NULL,
+            client_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            expires_at TIMESTAMP NOT NULL,
+            revoked INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(client_id) REFERENCES oauth_clients(client_id),
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+    
     conn.commit()
     conn.close()
 
@@ -56,6 +118,140 @@ def ensure_db_initialized():
     if not DB_INIT_DONE:
         init_db()
         DB_INIT_DONE = True
+
+
+# ============================================================================
+# OAuth 2.0 Helper Functions
+# ============================================================================
+
+def generate_authorization_code(length=32):
+    """Generate a cryptographically secure authorization code."""
+    return secrets.token_urlsafe(length)
+
+
+def generate_access_token(length=32):
+    """Generate a cryptographically secure access token."""
+    return secrets.token_urlsafe(length)
+
+
+def generate_refresh_token(length=48):
+    """Generate a cryptographically secure refresh token."""
+    return secrets.token_urlsafe(length)
+
+
+def validate_client(client_id, client_secret):
+    """Validate OAuth client credentials."""
+    conn = get_db_connection()
+    client = conn.execute(
+        "SELECT * FROM oauth_clients WHERE client_id = ?", (client_id,)
+    ).fetchone()
+    conn.close()
+    
+    if not client:
+        return None
+    
+    if client["client_secret"] != client_secret:
+        return None
+    
+    return client
+
+
+def validate_authorization_code(code, client_id, redirect_uri):
+    """Validate authorization code (must be unused and not expired)."""
+    conn = get_db_connection()
+    auth_code = conn.execute(
+        "SELECT * FROM authorization_codes WHERE code = ? AND client_id = ? AND redirect_uri = ?",
+        (code, client_id, redirect_uri)
+    ).fetchone()
+    conn.close()
+    
+    if not auth_code:
+        return None
+    
+    if auth_code["used"]:
+        return None
+    
+    if datetime.fromisoformat(auth_code["expires_at"]) < datetime.now():
+        return None
+    
+    return auth_code
+
+
+def mark_authorization_code_used(code):
+    """Mark authorization code as used (prevent reuse)."""
+    conn = get_db_connection()
+    conn.execute("UPDATE authorization_codes SET used = 1 WHERE code = ?", (code,))
+    conn.commit()
+    conn.close()
+
+
+def validate_access_token(token):
+    """Validate access token and return user info if valid."""
+    conn = get_db_connection()
+    access_token = conn.execute(
+        "SELECT * FROM access_tokens WHERE token = ?", (token,)
+    ).fetchone()
+    
+    if not access_token:
+        conn.close()
+        return None
+    
+    if datetime.fromisoformat(access_token["expires_at"]) < datetime.now():
+        conn.close()
+        return None
+    
+    user = conn.execute(
+        "SELECT id, username, email FROM users WHERE id = ?", 
+        (access_token["user_id"],)
+    ).fetchone()
+    conn.close()
+    
+    return user
+
+
+def validate_refresh_token(token, client_id):
+    """Validate refresh token and return if valid."""
+    conn = get_db_connection()
+    refresh_token = conn.execute(
+        "SELECT * FROM refresh_tokens WHERE token = ? AND client_id = ?",
+        (token, client_id)
+    ).fetchone()
+    
+    if not refresh_token:
+        conn.close()
+        return None
+    
+    if refresh_token["revoked"]:
+        conn.close()
+        return None
+    
+    if datetime.fromisoformat(refresh_token["expires_at"]) < datetime.now():
+        conn.close()
+        return None
+    
+    conn.close()
+    return refresh_token
+
+
+def require_access_token(f):
+    """Decorator to require valid access token in Authorization header."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        auth_header = request.headers.get("Authorization", "")
+        
+        if not auth_header.startswith("Bearer "):
+            return jsonify({"error": "missing_token"}), 401
+        
+        token = auth_header[7:]  # Remove "Bearer " prefix
+        user = validate_access_token(token)
+        
+        if not user:
+            return jsonify({"error": "invalid_token"}), 401
+        
+        request.oauth_user = user
+        return f(*args, **kwargs)
+    
+    return decorated_function
 
 
 @app.route("/")
@@ -134,65 +330,280 @@ def logout():
     return redirect(url_for("login"))
 
 
-@app.route("/login/google")
-def login_google():
-    redirect_uri = url_for('authorize_google', _external=True)
-    return google.authorize_redirect(redirect_uri)
+# ============================================================================
+# OAuth 2.0 Server Endpoints
+# ============================================================================
 
-
-@app.route("/authorize/google")
-def authorize_google():
-    try:
-        token = google.authorize_access_token()
-        user_data = token.get('userinfo')
+@app.route("/oauth/authorize", methods=["GET", "POST"])
+def oauth_authorize():
+    """Authorization endpoint - Step 1 of OAuth flow."""
+    if request.method == "GET":
+        # Redirect from client app asking for authorization
+        client_id = request.args.get("client_id")
+        redirect_uri = request.args.get("redirect_uri")
+        state = request.args.get("state", "")
+        scope = request.args.get("scope", "profile email")
         
-        if not user_data:
-            flash("Failed to retrieve user information from Google.", "error")
+        if not client_id or not redirect_uri:
+            return "Missing required parameters: client_id, redirect_uri", 400
+        
+        # Validate client
+        conn = get_db_connection()
+        client = conn.execute(
+            "SELECT * FROM oauth_clients WHERE client_id = ?", (client_id,)
+        ).fetchone()
+        conn.close()
+        
+        if not client:
+            return "Invalid client_id", 400
+        
+        # Check if redirect_uri is valid for this client
+        allowed_uris = client["redirect_uris"].split(",")
+        if redirect_uri not in allowed_uris:
+            return "Invalid redirect_uri for this client", 400
+        
+        # If user is not logged in, redirect to login
+        if "user_id" not in session:
+            session["oauth_pending"] = {
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "state": state,
+                "scope": scope
+            }
             return redirect(url_for("login"))
         
-        google_id = user_data.get('sub')
-        email = user_data.get('email')
-        name = user_data.get('name', email.split('@')[0])
+        # Show consent screen (user is logged in)
+        session["oauth_pending"] = {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "state": state,
+            "scope": scope
+        }
+        return render_template(
+            "oauth_consent.html",
+            client_name=client["app_name"],
+            scopes=scope.split()
+        )
+    
+    # POST - User approved consent
+    if "user_id" not in session:
+        return "User not authenticated", 401
+    
+    oauth_data = session.get("oauth_pending")
+    if not oauth_data:
+        return "No pending authorization", 400
+    
+    client_id = oauth_data["client_id"]
+    redirect_uri = oauth_data["redirect_uri"]
+    state = oauth_data["state"]
+    scope = oauth_data["scope"]
+    
+    # Generate authorization code
+    auth_code = generate_authorization_code()
+    expires_at = datetime.now() + timedelta(minutes=10)
+    
+    conn = get_db_connection()
+    conn.execute(
+        """
+        INSERT INTO authorization_codes 
+        (code, client_id, user_id, redirect_uri, scope, state, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (auth_code, client_id, session["user_id"], redirect_uri, scope, state, expires_at.isoformat())
+    )
+    conn.commit()
+    conn.close()
+    
+    # Clear pending OAuth data
+    session.pop("oauth_pending", None)
+    
+    # Redirect back to client with authorization code
+    redirect_url = f"{redirect_uri}?code={auth_code}&state={state}"
+    return redirect(redirect_url)
+
+
+@app.route("/oauth/token", methods=["POST"])
+def oauth_token():
+    """Token endpoint - Exchange authorization code for access token."""
+    client_id = request.form.get("client_id")
+    client_secret = request.form.get("client_secret")
+    code = request.form.get("code")
+    redirect_uri = request.form.get("redirect_uri")
+    grant_type = request.form.get("grant_type", "authorization_code")
+    
+    if not client_id or not client_secret:
+        return jsonify({"error": "invalid_client"}), 401
+    
+    # Validate client
+    client = validate_client(client_id, client_secret)
+    if not client:
+        return jsonify({"error": "invalid_client"}), 401
+    
+    if grant_type == "authorization_code":
+        # Authorization code flow
+        if not code or not redirect_uri:
+            return jsonify({"error": "invalid_request"}), 400
+        
+        # Validate authorization code
+        auth_code_record = validate_authorization_code(code, client_id, redirect_uri)
+        if not auth_code_record:
+            return jsonify({"error": "invalid_grant"}), 400
+        
+        # Mark code as used
+        mark_authorization_code_used(code)
+        
+        # Generate access and refresh tokens
+        access_token = generate_access_token()
+        refresh_token = generate_refresh_token()
+        
+        access_expires = datetime.now() + timedelta(hours=1)
+        refresh_expires = datetime.now() + timedelta(days=30)
         
         conn = get_db_connection()
         
-        # Check if user exists by google_id
-        user = conn.execute(
-            "SELECT * FROM users WHERE google_id = ?", (google_id,)
-        ).fetchone()
+        # Store access token
+        conn.execute(
+            """
+            INSERT INTO access_tokens (token, client_id, user_id, scope, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (access_token, client_id, auth_code_record["user_id"], 
+             auth_code_record["scope"], access_expires.isoformat())
+        )
         
-        if user:
-            # Existing user - update session
-            session['user_id'] = user['id']
-            session['username'] = user['username']
-            session['email'] = user['email']
-            conn.close()
-            return redirect(url_for("dashboard"))
+        # Store refresh token
+        conn.execute(
+            """
+            INSERT INTO refresh_tokens (token, client_id, user_id, expires_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (refresh_token, client_id, auth_code_record["user_id"], 
+             refresh_expires.isoformat())
+        )
         
-        # New user - create account
+        conn.commit()
+        conn.close()
+        
+        return jsonify({
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "refresh_token": refresh_token,
+            "scope": auth_code_record["scope"]
+        })
+    
+    elif grant_type == "refresh_token":
+        # Refresh token flow
+        refresh_token = request.form.get("refresh_token")
+        if not refresh_token:
+            return jsonify({"error": "invalid_request"}), 400
+        
+        # Validate refresh token
+        refresh_record = validate_refresh_token(refresh_token, client_id)
+        if not refresh_record:
+            return jsonify({"error": "invalid_grant"}), 400
+        
+        # Generate new access token
+        new_access_token = generate_access_token()
+        access_expires = datetime.now() + timedelta(hours=1)
+        
+        conn = get_db_connection()
+        conn.execute(
+            """
+            INSERT INTO access_tokens (token, client_id, user_id, scope, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (new_access_token, client_id, refresh_record["user_id"], 
+             "profile email", access_expires.isoformat())
+        )
+        conn.commit()
+        conn.close()
+        
+        return jsonify({
+            "access_token": new_access_token,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "refresh_token": refresh_token,
+            "scope": "profile email"
+        })
+    
+    else:
+        return jsonify({"error": "unsupported_grant_type"}), 400
+
+
+@app.route("/oauth/userinfo", methods=["GET"])
+@require_access_token
+def oauth_userinfo():
+    """User info endpoint - Return user data for valid access token."""
+    user = request.oauth_user
+    return jsonify({
+        "id": user["id"],
+        "username": user["username"],
+        "email": user["email"]
+    })
+
+
+# ============================================================================
+# Admin Endpoints - Register OAuth Clients
+# ============================================================================
+
+@app.route("/admin/clients", methods=["GET", "POST"])
+def admin_clients():
+    """Admin page to register new OAuth clients."""
+    if request.method == "POST":
+        app_name = request.form.get("app_name", "").strip()
+        redirect_uris = request.form.get("redirect_uris", "").strip()
+        
+        if not app_name or not redirect_uris:
+            flash("App name and redirect URIs are required.", "error")
+            return redirect(url_for("admin_clients"))
+        
+        # Generate client credentials
+        client_id = f"client_{secrets.token_hex(8)}"
+        client_secret = secrets.token_urlsafe(32)
+        
+        conn = get_db_connection()
         try:
-            cursor = conn.execute(
-                "INSERT INTO users (username, email, google_id) VALUES (?, ?, ?)",
-                (name, email, google_id)
+            conn.execute(
+                """
+                INSERT INTO oauth_clients (client_id, client_secret, app_name, redirect_uris)
+                VALUES (?, ?, ?, ?)
+                """,
+                (client_id, client_secret, app_name, redirect_uris)
             )
             conn.commit()
-            user_id = cursor.lastrowid
-            
-            session['user_id'] = user_id
-            session['username'] = name
-            session['email'] = email
-            
-            flash(f"Welcome {name}! You've been signed up via Google.", "success")
+            flash(
+                f"OAuth Client registered! ID: {client_id} | Secret: {client_secret}",
+                "success"
+            )
+        except Exception as e:
+            flash(f"Error registering client: {str(e)}", "error")
+        finally:
             conn.close()
-            return redirect(url_for("dashboard"))
-        except sqlite3.IntegrityError as e:
-            conn.close()
-            flash("An account with this email already exists.", "error")
-            return redirect(url_for("login"))
+        
+        return redirect(url_for("admin_clients"))
     
-    except Exception as e:
-        flash(f"An error occurred during Google login: {str(e)}", "error")
-        return redirect(url_for("login"))
+    # GET - Show registered clients
+    conn = get_db_connection()
+    clients = conn.execute(
+        "SELECT client_id, app_name, redirect_uris, created_at FROM oauth_clients ORDER BY created_at DESC"
+    ).fetchall()
+    conn.close()
+    
+    return render_template("admin_clients.html", clients=clients)
+
+
+@app.route("/oauth/info", methods=["GET"])
+def oauth_info():
+    """OAuth server information endpoint."""
+    return jsonify({
+        "authorization_endpoint": url_for("oauth_authorize", _external=True),
+        "token_endpoint": url_for("oauth_token", _external=True),
+        "userinfo_endpoint": url_for("oauth_userinfo", _external=True),
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "response_types_supported": ["code"],
+        "scope_supported": ["profile", "email"]
+    })
 
 
 if __name__ == "__main__":

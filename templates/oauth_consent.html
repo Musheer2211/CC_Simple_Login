@@ -1,0 +1,39 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div style="max-width: 500px; margin: 2rem auto; padding: 2rem; border: 1px solid #ddd; border-radius: 8px;">
+  <h2>Authorization Request</h2>
+  
+  <p>The application <strong>{{ client_name }}</strong> is requesting access to your account.</p>
+  
+  <div style="background-color: #f5f5f5; padding: 1rem; border-radius: 4px; margin: 1.5rem 0;">
+    <h3 style="margin-top: 0;">This app will have access to:</h3>
+    <ul>
+      {% for scope in scopes %}
+        <li>
+          {% if scope == 'profile' %}
+            Your profile information (username)
+          {% elif scope == 'email' %}
+            Your email address
+          {% else %}
+            {{ scope }}
+          {% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+  </div>
+  
+  <form method="post" action="{{ url_for('oauth_authorize') }}">
+    <button type="submit" style="background-color: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; margin-right: 1rem;">
+      Authorize
+    </button>
+    <a href="{{ url_for('login') }}" style="display: inline-block; background-color: #f44336; color: white; padding: 10px 20px; border-radius: 4px; text-decoration: none; font-weight: bold;">
+      Deny
+    </a>
+  </form>
+  
+  <p style="color: #666; font-size: 14px; margin-top: 2rem;">
+    You will be redirected back to the app after authorization.
+  </p>
+</div>
+{% endblock %}
