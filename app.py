@@ -309,6 +309,12 @@ def login():
         if user and check_password_hash(user["password_hash"], password):
             session["user_id"] = user["id"]
             session["username"] = user["username"]
+            
+            # Check if user was trying to do OAuth login
+            if session.get("oauth_login_pending"):
+                session.pop("oauth_login_pending", None)
+                return redirect(url_for("oauth_user_login"))
+            
             return redirect(url_for("dashboard"))
 
         flash("Invalid username or password.", "error")
@@ -337,21 +343,26 @@ def logout():
 @app.route("/oauth/user-login")
 def oauth_user_login():
     """Start OAuth login flow for regular users."""
-    # For user login, we create an internal OAuth client
-    # Generate state for CSRF protection
-    state = secrets.token_urlsafe(32)
-    session["oauth_state"] = state
-    session["oauth_redirect"] = url_for("oauth_user_callback", _external=True)
+    # If user is already logged in, skip to approval
+    if "user_id" in session:
+        # Generate state for CSRF protection
+        state = secrets.token_urlsafe(32)
+        session["oauth_state"] = state
+        session["oauth_redirect"] = url_for("oauth_user_callback", _external=True)
+        
+        # User is logged in, proceed directly to authorization
+        auth_url = (
+            f"{url_for('oauth_authorize', _external=True)}"
+            f"?client_id=__internal_user_login__"
+            f"&redirect_uri={session['oauth_redirect']}"
+            f"&scope=profile+email"
+            f"&state={state}"
+        )
+        return redirect(auth_url)
     
-    # Use a special internal client for user login
-    auth_url = (
-        f"{url_for('oauth_authorize', _external=True)}"
-        f"?client_id=__internal_user_login__"
-        f"&redirect_uri={session['oauth_redirect']}"
-        f"&scope=profile+email"
-        f"&state={state}"
-    )
-    return redirect(auth_url)
+    # User is not logged in, show login form with oauth pending flag
+    session["oauth_login_pending"] = True
+    return redirect(url_for("login"))
 
 
 @app.route("/oauth/user-callback")
